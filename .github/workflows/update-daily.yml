@@ -27,6 +27,11 @@ on:
         type: boolean
         default: false
 
+permissions:
+  # The job now writes the status block back to README and updates a rolling
+  # release, so the default read-only token is not enough.
+  contents: write
+
 concurrency:
   # Two updaters writing the same (ticker, year) chunks is the one way to
   # corrupt an otherwise idempotent upsert.
@@ -39,6 +44,9 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Needed so the status commit can be pushed back.
+          persist-credentials: true
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -82,6 +90,62 @@ jobs:
           SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
           SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
         run: uv run --no-default-groups python scripts/verify_integrity.py
+
+      # ---------------------------------------------------------------- status
+      # "When was this last updated?" should be answerable without opening the
+      # Actions tab. Two timestamps get published because they are different
+      # facts: `data through` is the newest stored session, `last run` only says
+      # the automation fired. A job that succeeds against a market that was shut
+      # for a week is green on the second and eight days stale on the first.
+      - name: Render the status block
+        # `always()` so a failed run publishes a red badge rather than silently
+        # leaving yesterday's green one in place.
+        if: always()
+        env:
+          SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
+          SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
+        continue-on-error: true
+        run: |
+          uv run --no-default-groups python scripts/status_report.py \
+            --readme README.md \
+            --release-notes /tmp/release-notes.md
+
+      - name: Commit the status block if it changed
+        if: always()
+        continue-on-error: true
+        run: |
+          if git diff --quiet -- README.md; then
+            echo "status block unchanged — nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          # [skip ci] so the push does not retrigger anything. The commit is also
+          # the thing that resets GitHub's 60-day scheduled-workflow inactivity
+          # timer, so the schedule keeps itself alive as a side effect.
+          git commit -m "chore(data): update through ${{ github.run_id }} [skip ci]"
+          git push
+
+      - name: Update the rolling 'latest data' release
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -s /tmp/release-notes.md || exit 0
+          # One rolling release rather than one per night: a nightly job would
+          # otherwise produce hundreds of releases nobody reads.
+          if gh release view data-latest >/dev/null 2>&1; then
+            gh release edit data-latest \
+              --title "Data as of $(date -u '+%Y-%m-%d %H:%M UTC')" \
+              --notes-file /tmp/release-notes.md
+          else
+            gh release create data-latest \
+              --title "Data as of $(date -u '+%Y-%m-%d %H:%M UTC')" \
+              --notes-file /tmp/release-notes.md \
+              --latest
+          fi
 
       - name: Keep the run report
         if: always()
