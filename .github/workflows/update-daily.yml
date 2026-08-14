@@ -26,6 +26,14 @@ on:
         description: "Force a full-adjustment resync"
         type: boolean
         default: false
+      limit:
+        description: "Only update the first N tickers (smoke test; blank = all)"
+        type: string
+        default: ""
+      skip_universe:
+        description: "Skip the screener refresh (faster; use for a quick check)"
+        type: boolean
+        default: false
 
 permissions:
   # The job now writes the status block back to README and updates a rolling
@@ -64,14 +72,28 @@ jobs:
       - name: Decide which mode this run is
         id: mode
         run: |
+          ARGS=""
+          LABEL="incremental"
+          FULL="false"
           if [ "${{ github.event.schedule }}" = "0 03 * * 0" ] || \
              [ "${{ inputs.full_refresh }}" = "true" ]; then
-            echo "flag=--full-refresh" >> "$GITHUB_OUTPUT"
-            echo "label=full refresh" >> "$GITHUB_OUTPUT"
-          else
-            echo "flag=" >> "$GITHUB_OUTPUT"
-            echo "label=incremental" >> "$GITHUB_OUTPUT"
+            ARGS="--full-refresh"
+            LABEL="full refresh"
+            FULL="true"
           fi
+          # A manual smoke test: prove the secret, the cluster and the Yahoo
+          # path all work in about a minute, instead of finding out 40 minutes
+          # into a full pass. Only reachable via workflow_dispatch.
+          if [ -n "${{ inputs.limit }}" ]; then
+            ARGS="$ARGS --limit ${{ inputs.limit }}"
+            LABEL="$LABEL, first ${{ inputs.limit }} tickers"
+          fi
+          if [ "${{ inputs.skip_universe }}" = "true" ]; then
+            ARGS="$ARGS --skip-universe"
+          fi
+          echo "flag=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
 
       - name: Run the updater (${{ steps.mode.outputs.label }})
         env:
@@ -85,7 +107,7 @@ jobs:
         run: uv run --no-default-groups python scripts/update_daily.py ${{ steps.mode.outputs.flag }}
 
       - name: Verify integrity after a full refresh
-        if: steps.mode.outputs.flag == '--full-refresh'
+        if: steps.mode.outputs.full == 'true' && inputs.limit == ''
         env:
           SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
           SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
@@ -98,9 +120,12 @@ jobs:
       # the automation fired. A job that succeeds against a market that was shut
       # for a week is green on the second and eight days stale on the first.
       - name: Render the status block
+        # A --limit smoke test covers a handful of tickers, so its counters are
+        # not the repository's status. Publishing them would make the README
+        # claim 20 tickers when 2,360 are stored.
         # `always()` so a failed run publishes a red badge rather than silently
         # leaving yesterday's green one in place.
-        if: always()
+        if: always() && inputs.limit == ''
         env:
           SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
           SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
@@ -111,7 +136,7 @@ jobs:
             --release-notes /tmp/release-notes.md
 
       - name: Commit the status block if it changed
-        if: always()
+        if: always() && inputs.limit == ''
         continue-on-error: true
         run: |
           if git diff --quiet -- README.md; then
@@ -128,7 +153,7 @@ jobs:
           git push
 
       - name: Update the rolling 'latest data' release
-        if: always()
+        if: always() && inputs.limit == ''
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
