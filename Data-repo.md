@@ -4,7 +4,7 @@ Traced by walking the actual import graph of `scripts/update_daily.py`, then bui
 tested: `uv sync` succeeds, all six retained scripts run, and the environment excludes every
 research dependency.
 
-**27 files, 460 KB.** Everything else stays off GitHub.
+**28 files, ~470 KB.** Everything else stays off GitHub.
 
 ---
 
@@ -40,6 +40,7 @@ src/sse/
 scripts/
     _path.py                # imported as bare `import _path` — easy to miss
     update_daily.py         # the scheduled job
+    status_report.py        # publishes "last updated" into README + release
     verify_integrity.py     # runs after each full refresh
     backfill.py             # for re-seeding or --missing-only
     discover_universe.py    # manual universe re-runs
@@ -47,6 +48,7 @@ scripts/
     ping_atlas.py           # connectivity check
 
 reports/.gitkeep            # the run report is written here
+README.md                   # must exist — the status block is spliced into it
 ```
 
 ### Strictly required vs. merely useful
