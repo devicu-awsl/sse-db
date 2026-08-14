@@ -1,0 +1,95 @@
+name: update-atlas
+
+# Answers "can the database keep itself current without me running the script?"
+#
+# Atlas cannot do this itself.  Atlas App Services has reached end-of-life, and
+# even where Scheduled Triggers survive they run JavaScript in a serverless
+# sandbox with no access to `yfinance`, to `sse.ingest.quality.sanitize`, or to
+# the int32/sha256 binary codec in `sse.codec` that every chunk is written
+# through.  A trigger could at best write documents the repository layer cannot
+# read.  So the scheduler lives outside Atlas and runs the real script.
+
+on:
+  schedule:
+    # SSE closes 15:00 CST = 07:00 UTC. Run at 12:00 UTC so Yahoo has settled
+    # the day's bars. GitHub's scheduler is best-effort and can lag under load,
+    # which is fine: update_daily.py is idempotent and re-downloads an overlap
+    # window anyway.
+    - cron: "0 12 * * 1-5"
+    # Weekly full-adjustment resync. A split retroactively rewrites the entire
+    # adj_close history, so a delta-only updater drifts out of sync silently and
+    # for ever. Sunday, when nothing else competes for the Yahoo budget.
+    - cron: "0 03 * * 0"
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: "Force a full-adjustment resync"
+        type: boolean
+        default: false
+
+concurrency:
+  # Two updaters writing the same (ticker, year) chunks is the one way to
+  # corrupt an otherwise idempotent upsert.
+  group: update-atlas
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Recreate the locked environment
+        # --no-default-groups because pyproject sets `default-groups = "all"`,
+        # which would otherwise drag scipy, scikit-learn, statsmodels,
+        # matplotlib and jupyterlab into a job that only needs yfinance and
+        # pymongo. pyproject.toml and uv.lock stay byte-identical to the
+        # research repo, so the two never drift.
+        run: uv sync --no-default-groups
+
+      - name: Decide which mode this run is
+        id: mode
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 03 * * 0" ] || \
+             [ "${{ inputs.full_refresh }}" = "true" ]; then
+            echo "flag=--full-refresh" >> "$GITHUB_OUTPUT"
+            echo "label=full refresh" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "label=incremental" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the updater (${{ steps.mode.outputs.label }})
+        env:
+          # Settings are read from the environment with the SSE_ prefix, so no
+          # .env file is needed and the URI never touches the filesystem.
+          SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
+          SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
+        # Non-zero exit already means something real: 1 failures above tolerance
+        # or validation errors, 2 storage guard tripped, 3 database down. Let it
+        # fail the job — a silent updater is the failure mode that matters.
+        run: uv run --no-default-groups python scripts/update_daily.py ${{ steps.mode.outputs.flag }}
+
+      - name: Verify integrity after a full refresh
+        if: steps.mode.outputs.flag == '--full-refresh'
+        env:
+          SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
+          SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
+        run: uv run --no-default-groups python scripts/verify_integrity.py
+
+      - name: Keep the run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-report-${{ github.run_id }}
+          path: |
+            reports/update_last.json
+            reports/integrity.json
+          if-no-files-found: ignore
+          retention-days: 30
