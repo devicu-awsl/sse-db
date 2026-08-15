@@ -11,14 +11,19 @@ name: update-atlas
 
 on:
   schedule:
-    # SSE closes 15:00 CST = 07:00 UTC. Run at 12:00 UTC so Yahoo has settled
-    # the day's bars. GitHub's scheduler is best-effort and can lag under load,
-    # which is fine: update_daily.py is idempotent and re-downloads an overlap
-    # window anyway.
-    - cron: "0 12 * * 1-5"
-    # Weekly full-adjustment resync. A split retroactively rewrites the entire
-    # adj_close history, so a delta-only updater drifts out of sync silently and
-    # for ever. Sunday, when nothing else competes for the Yahoo budget.
+    # 00:00 CST (UTC+8) every day = 16:00 UTC the previous day. Cron is UTC only,
+    # so the hour is shifted, not the intent. The most recent completed session
+    # at that moment is the previous trading day, which closed at 15:00 CST with
+    # nine hours for Yahoo to settle its bars.
+    #
+    # `* * *` runs on weekends too, and those runs are no-ops that still cost
+    # ~30 minutes of Actions minutes each because the Yahoo rate limiter
+    # dominates. To skip them use "0 16 * * 0-4": 16:00 UTC Sun-Thu maps to
+    # 00:00 CST Mon-Fri, which covers every session.
+    - cron: "0 16 * * *"
+    # Weekly full-adjustment resync at 11:00 CST Sunday. A split retroactively
+    # rewrites the entire adj_close history, so a delta-only updater drifts out
+    # of sync silently and for ever.
     - cron: "0 03 * * 0"
   workflow_dispatch:
     inputs:
@@ -95,7 +100,30 @@ jobs:
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
           echo "full=$FULL" >> "$GITHUB_OUTPUT"
 
+      # `concurrency:` above only serialises runs inside GitHub. It knows
+      # nothing about `python scripts/update_daily.py` running on a laptop
+      # against the same Atlas cluster. The lock therefore lives in the
+      # `ingestion_runs` collection, which both writers can see.
+      - name: Check nobody else is updating (laptop included)
+        id: guard
+        env:
+          SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
+          SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
+        run: |
+          set +e
+          uv run --no-default-groups python scripts/run_guard.py --wait 20
+          rc=$?
+          set -e
+          if [ "$rc" = "75" ]; then
+            echo "busy=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::another updater is running; skipping rather than racing it"
+            exit 0
+          fi
+          echo "busy=false" >> "$GITHUB_OUTPUT"
+          exit $rc
+
       - name: Run the updater (${{ steps.mode.outputs.label }})
+        if: steps.guard.outputs.busy != 'true'
         env:
           # Settings are read from the environment with the SSE_ prefix, so no
           # .env file is needed and the URI never touches the filesystem.
@@ -107,7 +135,7 @@ jobs:
         run: uv run --no-default-groups python scripts/update_daily.py ${{ steps.mode.outputs.flag }}
 
       - name: Verify integrity after a full refresh
-        if: steps.mode.outputs.full == 'true' && inputs.limit == ''
+        if: steps.mode.outputs.full == 'true' && inputs.limit == '' && steps.guard.outputs.busy != 'true'
         env:
           SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
           SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
@@ -125,7 +153,7 @@ jobs:
         # claim 20 tickers when 2,360 are stored.
         # `always()` so a failed run publishes a red badge rather than silently
         # leaving yesterday's green one in place.
-        if: always() && inputs.limit == ''
+        if: always() && inputs.limit == '' && steps.guard.outputs.busy != 'true'
         env:
           SSE_MONGODB_URI: ${{ secrets.SSE_MONGODB_URI }}
           SSE_DB_NAME: ${{ vars.SSE_DB_NAME || 'sse_market' }}
@@ -136,7 +164,7 @@ jobs:
             --release-notes /tmp/release-notes.md
 
       - name: Commit the status block if it changed
-        if: always() && inputs.limit == ''
+        if: always() && inputs.limit == '' && steps.guard.outputs.busy != 'true'
         continue-on-error: true
         run: |
           if git diff --quiet -- README.md; then
@@ -147,13 +175,30 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md
           # [skip ci] so the push does not retrigger anything. The commit is also
-          # the thing that resets GitHub's 60-day scheduled-workflow inactivity
-          # timer, so the schedule keeps itself alive as a side effect.
-          git commit -m "chore(data): update through ${{ github.run_id }} [skip ci]"
-          git push
+          # what resets GitHub's 60-day scheduled-workflow inactivity timer, so
+          # the schedule keeps itself alive as a side effect.
+          git commit -m "chore(data): status through ${{ github.run_id }} [skip ci]"
+          # You push to this branch from a laptop too, so the remote may have
+          # moved since checkout. Rebase and retry rather than failing the job
+          # or, worse, force-pushing over your own work. The status block is
+          # regenerated content, so `--ours` on a conflict inside it is safe --
+          # but only inside it, which is why the rebase is scoped to README.md.
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "push rejected (attempt $attempt) — rebasing onto the remote"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git checkout --ours README.md 2>/dev/null || true
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              git checkout --ours -- README.md
+              git add README.md
+              GIT_EDITOR=true git rebase --continue || git rebase --abort
+            fi
+            sleep 5
+          done
+          echo "::warning::could not push the status block after 3 attempts"
 
       - name: Update the rolling 'latest data' release
-        if: always() && inputs.limit == ''
+        if: always() && inputs.limit == '' && steps.guard.outputs.busy != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
