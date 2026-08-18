@@ -1,67 +1,14 @@
 name: update-atlas
 
-# Answers "can the database keep itself current without me running the script?"
-#
-# Atlas cannot do this itself.  Atlas App Services has reached end-of-life, and
-# even where Scheduled Triggers survive they run JavaScript in a serverless
-# sandbox with no access to `yfinance`, to `sse.ingest.quality.sanitize`, or to
-# the int32/sha256 binary codec in `sse.codec` that every chunk is written
-# through.  A trigger could at best write documents the repository layer cannot
-# read.  So the scheduler lives outside Atlas and runs the real script.
-#
-# CREDENTIALS.  Nothing here reads `.env`.  `Settings` in src/sse/config.py is a
-# pydantic-settings model with `env_prefix="SSE_"`, and an environment variable
-# always outranks a `.env` file, so exporting SSE_MONGODB_URI into a step is
-# exactly equivalent to writing it into `.env` — without the file existing.
-# `.env.example` is documentation for humans; CI does not need it and must not
-# have a real `.env` committed.  Set the value once as a repository secret:
-#
-#   Settings -> Secrets and variables -> Actions -> New repository secret
-#     Name:  SSE_MONGODB_URI
-#     Value: mongodb+srv://USER:PERCENT-ENCODED-PASSWORD@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
-#
-# Paste the value WITHOUT the surrounding quotes that `.env.example` shows —
-# a shell strips those, the secret box does not, and `"mongodb+srv://...` is
-# not a valid URI scheme.
-
 on:
-  # ------------------------------------------------------------------ toggle
-  # Run on every sync so a change can be proven immediately, instead of waiting
-  # for 16:00 UTC to find out.  Two brakes stop this becoming expensive:
-  #
-  #   1. the job-level `if:` below — a push only runs when the repository
-  #      variable RUN_ON_PUSH is "true", or the commit message says [run ci].
-  #      Turn it on now, delete the variable when you are done testing.
-  #      (Settings -> Secrets and variables -> Actions -> Variables tab.)
-  #   2. a push run is forced into smoke-test mode (a handful of tickers, no
-  #      screener refresh) in the "Decide which mode this run is" step, so it
-  #      costs about a minute rather than 30.
-  #
-  # `paths-ignore` keeps documentation edits — including the bot's own status
-  # commit — from triggering anything.  The bot also tags that commit [skip ci],
-  # which GitHub honours for push events, so the loop is closed twice over.
   push:
     branches:
       - main
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
-      - ".gitignore"
 
   schedule:
-    # 00:00 CST (UTC+8) every day = 16:00 UTC the previous day. Cron is UTC only,
-    # so the hour is shifted, not the intent. The most recent completed session
-    # at that moment is the previous trading day, which closed at 15:00 CST with
-    # nine hours for Yahoo to settle its bars.
-    #
-    # `* * *` runs on weekends too, and those runs are no-ops that still cost
-    # ~30 minutes of Actions minutes each because the Yahoo rate limiter
-    # dominates. To skip them use "0 16 * * 0-4": 16:00 UTC Sun-Thu maps to
-    # 00:00 CST Mon-Fri, which covers every session.
+    # GitHub cron is UTC: 16:00 UTC is 00:00 China Standard Time.
     - cron: "0 16 * * *"
-    # Weekly full-adjustment resync at 11:00 CST Sunday. A split retroactively
-    # rewrites the entire adj_close history, so a delta-only updater drifts out
-    # of sync silently and for ever.
+    # Weekly full-adjustment resync at 11:00 China Standard Time on Sunday.
     - cron: "0 03 * * 0"
 
   workflow_dispatch:
@@ -80,26 +27,14 @@ on:
         default: false
 
 permissions:
-  # The job now writes the status block back to README and updates a rolling
-  # release, so the default read-only token is not enough.
   contents: write
 
 concurrency:
-  # Two updaters writing the same (ticker, year) chunks is the one way to
-  # corrupt an otherwise idempotent upsert.
   group: update-atlas
   cancel-in-progress: false
 
 jobs:
   update:
-    # The push brake.  Scheduled and manual runs are unaffected; a push runs
-    # only when you have opted in, either standing (the RUN_ON_PUSH variable)
-    # or for one commit ([run ci] anywhere in the message).
-    if: >-
-      github.event_name != 'push'
-      || vars.RUN_ON_PUSH == 'true'
-      || contains(github.event.head_commit.message, '[run ci]')
-
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -150,12 +85,7 @@ jobs:
           enable-cache: true
 
       - name: Recreate the locked environment
-        # --no-default-groups because pyproject sets `default-groups = "all"`,
-        # which would otherwise drag scipy, scikit-learn, statsmodels,
-        # matplotlib and jupyterlab into a job that only needs yfinance and
-        # pymongo. pyproject.toml and uv.lock stay byte-identical to the
-        # research repo, so the two never drift.
-        run: uv sync --no-default-groups
+        run: uv sync --locked --no-default-groups
 
       - name: Decide which mode this run is
         id: mode
@@ -164,13 +94,10 @@ jobs:
         # is the argument, not a variable holding it, so anything typed into the
         # dispatch form is executed by bash; "$LIMIT" is only ever read.
         env:
-          EVENT: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
           IN_FULL: ${{ inputs.full_refresh }}
           IN_LIMIT: ${{ inputs.limit }}
           IN_SKIP_UNIVERSE: ${{ inputs.skip_universe }}
-          # Override without editing the file: set a PUSH_SMOKE_LIMIT variable.
-          PUSH_SMOKE_LIMIT: ${{ vars.PUSH_SMOKE_LIMIT || '20' }}
         run: |
           ARGS=""
           LABEL="incremental"
@@ -181,16 +108,6 @@ jobs:
             ARGS="--full-refresh"
             LABEL="full refresh"
             FULL="true"
-          fi
-
-          # A push means "I just changed something, does it still work?" — not
-          # "ingest the whole exchange".  Force the cheap path: the secret, the
-          # cluster, the Yahoo client and the codec are all exercised in about a
-          # minute.  Use workflow_dispatch when you want a real pass.
-          if [ "$EVENT" = "push" ] && [ -z "$LIMIT" ]; then
-            LIMIT="$PUSH_SMOKE_LIMIT"
-            ARGS="$ARGS --skip-universe"
-            LABEL="push smoke test"
           fi
 
           # A manual smoke test: prove the secret, the cluster and the Yahoo
@@ -207,10 +124,6 @@ jobs:
           echo "flag=$ARGS"   >> "$GITHUB_OUTPUT"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
           echo "full=$FULL"   >> "$GITHUB_OUTPUT"
-          # Downstream steps ask "was this a partial run?" — which is now also
-          # true for pushes, where `inputs.limit` is null.  They must read this
-          # output, not the input, or a 20-ticker push would publish a status
-          # block claiming the repository holds 20 tickers.
           echo "limit=$LIMIT" >> "$GITHUB_OUTPUT"
 
       # `concurrency:` above only serialises runs inside GitHub. It knows
@@ -290,9 +203,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md
-          # [skip ci] so the push does not retrigger anything. The commit is also
-          # what resets GitHub's 60-day scheduled-workflow inactivity timer, so
-          # the schedule keeps itself alive as a side effect.
+          # Avoid retriggering the workflows with the generated status commit.
           git commit -m "chore(data): status through ${{ github.run_id }} [skip ci]"
           # You push to this branch from a laptop too, so the remote may have
           # moved since checkout. Rebase and retry rather than failing the job

@@ -63,7 +63,7 @@ jobs:
           enable-cache: true
 
       - name: Recreate the locked environment
-        run: uv sync --no-default-groups
+        run: uv sync --locked --no-default-groups
 
       # Cheapest possible check, and the one that catches most breakage: does
       # the import graph the nightly job depends on still resolve at all?
